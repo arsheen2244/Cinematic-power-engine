@@ -8,6 +8,19 @@ Built entirely in the browser with [MediaPipe Hands](https://developers.google.c
 
 ---
 
+## 🎬 Demo
+
+### Fire / Ice
+![Fire / Ice](assets/fire-ice.png)
+
+### Lightning
+![Lightning](assets/lightning.png)
+
+### Red / Blue
+![Red / Blue](assets/red-blue.png)
+
+---
+
 ## ✨ Features
 
 - **Two-handed independent tracking** — each hand drives its own element, so you can mix fire in one hand and ice in the other simultaneously.
