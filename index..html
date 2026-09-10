@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cinematic Fire Engine | Dark Mode & Dynamic Lighting</title>
+    <style>
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            background: #000;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            transform: scaleX(-1);
+        }
+
+        video { display: none; }
+
+        /* ---- UI overlay ---- */
+        #ui-layer {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            color: #eee;
+            z-index: 10;
+        }
+
+        #hint {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            font-size: 12px;
+            letter-spacing: 0.5px;
+            opacity: 0.6;
+            max-width: 260px;
+            line-height: 1.5;
+        }
+
+        #power-select {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            pointer-events: auto;
+        }
+
+        .power-btn {
+            background: rgba(20, 20, 20, 0.65);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            color: #eee;
+            font-family: inherit;
+            font-size: 12px;
+            padding: 10px 16px;
+            border-radius: 999px;
+            cursor: pointer;
+            backdrop-filter: blur(4px);
+            transition: background 0.15s, border-color 0.15s;
+        }
+
+        .power-btn:hover { background: rgba(60, 60, 60, 0.75); }
+
+        .power-btn.active {
+            border-color: #fff;
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        #status {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            font-size: 12px;
+            opacity: 0.7;
+            text-align: right;
+        }
+
+        /* ---- Error / permission overlay ---- */
+        #error-overlay {
+            position: absolute;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.92);
+            color: #eee;
+            text-align: center;
+            padding: 24px;
+            z-index: 20;
+        }
+
+        #error-overlay.visible { display: flex; }
+
+        #error-box { max-width: 420px; }
+
+        #error-box h2 { margin: 0 0 12px; font-size: 16px; color: #ff8a5c; }
+
+        #error-box p { font-size: 13px; line-height: 1.6; opacity: 0.85; margin: 0 0 18px; }
+
+        #retry-btn {
+            background: #fff;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 13px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="ui-layer">
+        <div id="hint">
+            Left hand / right hand each drive their own effect.<br>
+            Open hand = build power &middot; pinch = draw.<br>
+            Keys 1 / 2 / 3 also switch modes.
+        </div>
+        <div id="status">Loading model&hellip;</div>
+        <div id="power-select">
+            <button class="power-btn" data-power="fire_ice">Fire / Ice</button>
+            <button class="power-btn" data-power="lightning">Lightning</button>
+            <button class="power-btn" data-power="red_blue">Red / Blue</button>
+        </div>
+    </div>
+
+    <div id="error-overlay">
+        <div id="error-box">
+            <h2 id="error-title">Camera unavailable</h2>
+            <p id="error-message">Something went wrong accessing your camera.</p>
+            <button id="retry-btn">Try again</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script>
+        'use strict';
+
+        // ============================================================
+        // Config — every previously-hardcoded "magic number" lives here
+        // ============================================================
+        const CONFIG = {
+            pinchHoldFrames: 5,
+            pinchVelocityCancel: 0.08,
+            pinchDistRatio: 0.45,
+            drawUnlockMs: 0,
+            handOpenMinFingers: 3,
+            intensityRise: 0.05,
+            intensityFall: 0.15,
+            surgeDecay: 0.92,
+            surgeFloor: 0.01,
+            lightningRiseWhenOpen: 0.08,
+            lightningFallWhenClosed: 0.05,
+            lightningFallOtherModes: 0.1,
+            glowRadiusBase: [550, 400],   // [left-hand, right-hand]
+            glowFlickerAmp: [25, 20],
+            glowFlickerSpeed: [0.02, 0.01]
+        };
+
+        // Particle gradient stops per elemental type
+        const PARTICLE_COLORS = {
+            fire: [[0, '255,255,220'], [0.2, '255,180,0'], [0.5, '255,40,0']],
+            ice: [[0, '255,255,255'], [0.3, '180,240,255'], [0.6, '0,150,255']],
+            red: [[0, '255,200,200'], [0.3, '255,0,0'], [0.6, '100,0,0']],
+            blue: [[0, '200,200,255'], [0.3, '0,0,255'], [0.6, '0,0,100']]
+        };
+
+        // Which elemental type + glow color each hand uses per power mode.
+        // targetIndex 0 = left hand slot, 1 = right hand slot.
+        const POWER_STYLES = {
+            fire_ice: {
+                0: { type: 'fire', glow: ['255,60,0', '255,30,0'] },
+                1: { type: 'ice', glow: ['100,200,255', '0,100,255'] }
+            },
+            red_blue: {
+                0: { type: 'red', glow: ['255,0,0', '200,0,0'] },
+                1: { type: 'blue', glow: ['0,0,255', '0,50,255'] }
+            }
+        };
+
+        const HAND_CONNECTIONS = [
+            [0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8],
+            [5, 9], [9, 10], [10, 11], [11, 12], [9, 13], [13, 14], [14, 15],
+            [15, 16], [13, 17], [17, 18], [18, 19], [19, 20], [0, 17]
+        ];
+
+        // ============================================================
+        // DOM refs
+        // ============================================================
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const errorOverlay = document.getElementById('error-overlay');
+        const errorTitle = document.getElementById('error-title');
+        const errorMessage = document.getElementById('error-message');
+        const retryBtn = document.getElementById('retry-btn');
+        const powerButtons = Array.from(document.querySelectorAll('.power-btn'));
+
+        // ============================================================
+        // State
+        // ============================================================
+        let startTime = null;
+        let particles = [];
+        let lightningBolts = [];
+        let currentPower = 'fire_ice';
+        let lightningIntensity = 0;
+        let handIntensities = [0, 0];
+        let handSurges = [0, 0];
+        let lastHandOpenState = [false, false];
+
+        const pointingState = {
+            left: { frames: 0, active: false, lastWrist: null },
+            right: { frames: 0, active: false, lastWrist: null }
+        };
+
+        // ============================================================
+        // UI helpers
+        // ============================================================
+        function setPower(power) {
+            currentPower = power;
+            powerButtons.forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.power === power);
+            });
+        }
+
+        function showError(title, message) {
+            errorTitle.textContent = title;
+            errorMessage.textContent = message;
+            errorOverlay.classList.add('visible');
+        }
+
+        function hideError() {
+            errorOverlay.classList.remove('visible');
+        }
+
+        powerButtons.forEach(btn => {
+            btn.addEventListener('click', () => setPower(btn.dataset.power));
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === '1') setPower('fire_ice');
+            if (e.key === '2') setPower('lightning');
+            if (e.key === '3') setPower('red_blue');
+        });
+
+        setPower(currentPower);
+
+        // ============================================================
+        // Particle + lightning spawning (unified, no per-type duplicates)
+        // ============================================================
+        function spawnParticle(type, x, y, isDrawing, surge = 0) {
+            const targetIndex = (type === 'fire' || type === 'red') ? 0 : 1;
+            if (!isDrawing && Math.random() > handIntensities[targetIndex]) return;
+
+            const count = isDrawing ? 2 : 1;
+            const risePull = isDrawing ? 0 : ((Math.random() * (targetIndex === 0 ? -10 : -5)) - (targetIndex === 0 ? 4 : 2)) - (surge * (targetIndex === 0 ? 20 : 15));
+
+            for (let i = 0; i < count; i++) {
+                particles.push({
+                    x: x + (Math.random() - 0.5) * (isDrawing ? 10 : 15),
+                    y: y + (Math.random() - 0.5) * (isDrawing ? 10 : 15),
+                    vx: isDrawing ? 0 : (Math.random() - 0.5) * 4,
+                    vy: isDrawing ? 0 : risePull,
+                    life: 1.0,
+                    decay: isDrawing ? 0.0055 : 0.06,
+                    size: isDrawing
+                        ? (Math.random() * 20 + 20)
+                        : (targetIndex === 0 ? (Math.random() * 22 + 8) : (Math.random() * 20 + 5)),
+                    type
+                });
+            }
+        }
+
+        function spawnLightning(x, y) {
+            if (Math.random() > lightningIntensity) return;
+            const bolt = [];
+            let cx = x;
+            let cy = y;
+            for (let i = 0; i < 25; i++) {
+                bolt.push({ x: cx, y: cy });
+                cx += (Math.random() - 0.5) * 80;
+                cy += (Math.random() - 0.8) * 80;
+            }
+            lightningBolts.push({
+                path: bolt,
+                life: 1.0,
+                color: Math.random() > 0.5 ? '#e0ffff' : '#00bfff'
+            });
+        }
+
+        // ============================================================
+        // Gesture detection
+        // ============================================================
+        function isPinchingInternal(landmarks, state) {
+            const thumb = landmarks[4];
+            const index = landmarks[8];
+            const wrist = landmarks[0];
+
+            let velocity = 0;
+            if (state.lastWrist) {
+                velocity = Math.hypot(wrist.x - state.lastWrist.x, wrist.y - state.lastWrist.y);
+            }
+            state.lastWrist = { x: wrist.x, y: wrist.y };
+
+            if (velocity > CONFIG.pinchVelocityCancel) return false;
+
+            // A pinch is thumb-tip and index-tip touching, scaled to hand
+            // size so it works at any distance from the camera. We
+            // deliberately do NOT require the other three fingers to be
+            // extended — a natural pinch usually curls them, and requiring
+            // an "OK sign" pose was the original bug that made this feel
+            // broken. We still guard against a closed fist by checking
+            // that the index tip is clearly further from the palm than
+            // the thumb is folding toward it — i.e. the index is at least
+            // partly extended, the way it is in an actual pinch.
+            const midPip = landmarks[9];
+            const handSize = Math.hypot(midPip.x - wrist.x, midPip.y - wrist.y);
+
+            const indexExtension = Math.hypot(index.x - wrist.x, index.y - wrist.y);
+            if (indexExtension < handSize * 0.9) return false; // index still curled into a fist
+
+            const pinchDist = Math.hypot(thumb.x - index.x, thumb.y - index.y);
+            return pinchDist < handSize * CONFIG.pinchDistRatio;
+        }
+
+        function isPinching(landmarks, isRightHand) {
+            const state = isRightHand ? pointingState.right : pointingState.left;
+            const raw = isPinchingInternal(landmarks, state);
+
+            if (raw) {
+                state.frames = CONFIG.pinchHoldFrames;
+                state.active = true;
+            } else {
+                state.frames--;
+                if (state.frames <= 0) {
+                    state.frames = 0;
+                    state.active = false;
+                }
+            }
+            return state.active;
+        }
+
+        function isHandOpen(landmarks) {
+            let open = 0;
+            const wrist = landmarks[0];
+            const tips = [8, 12, 16, 20];
+            const pips = [6, 10, 14, 18];
+            for (let i = 0; i < tips.length; i++) {
+                const tip = landmarks[tips[i]];
+                const pip = landmarks[pips[i]];
+                const dTip = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
+                const dPip = Math.hypot(pip.x - wrist.x, pip.y - wrist.y);
+                if (dTip > dPip) open++;
+            }
+            return open >= CONFIG.handOpenMinFingers;
+        }
+
+        // ============================================================
+        // Rendering helpers (unified glow + connection-particle painter)
+        // ============================================================
+        function renderHandGlow(x, y, intensity, targetIndex, coreColor, midColor) {
+            const flicker = Math.sin(Date.now() * CONFIG.glowFlickerSpeed[targetIndex]) * CONFIG.glowFlickerAmp[targetIndex];
+            const radius = CONFIG.glowRadiusBase[targetIndex] + flicker;
+            const coreAlpha = targetIndex === 0 ? 0.45 : 0.4;
+            const midAlpha = targetIndex === 0 ? 0.15 : 0.1;
+
+            const glow = canvasCtx.createRadialGradient(x, y, 0, x, y, radius);
+            glow.addColorStop(0, `rgba(${coreColor}, ${coreAlpha * intensity})`);
+            glow.addColorStop(0.5, `rgba(${midColor}, ${midAlpha * intensity})`);
+            glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+
+            canvasCtx.globalCompositeOperation = 'screen';
+            canvasCtx.fillStyle = glow;
+            canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+        }
+
+        function spawnAlongHand(type, landmarks) {
+            landmarks.forEach(pt => spawnParticle(type, pt.x * canvasElement.width, pt.y * canvasElement.height, false));
+            HAND_CONNECTIONS.forEach(([s, e]) => {
+                const start = landmarks[s];
+                const end = landmarks[e];
+                spawnParticle(
+                    type,
+                    ((start.x + end.x) / 2) * canvasElement.width,
+                    ((start.y + end.y) / 2) * canvasElement.height,
+                    false
+                );
+            });
+        }
+
+        // ============================================================
+        // Main per-frame callback
+        // ============================================================
+        function onResults(results) {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+
+            if (!startTime) startTime = Date.now();
+
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            canvasCtx.globalCompositeOperation = 'multiply';
+            canvasCtx.fillStyle = 'rgba(10, 5, 0, 0.5)';
+            canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.globalCompositeOperation = 'source-over';
+
+            const hands = results.multiHandLandmarks || [];
+
+            if (hands.length > 0) {
+                statusEl.textContent = `Tracking ${hands.length} hand${hands.length > 1 ? 's' : ''}`;
+
+                const anyHandOpen = hands.some(isHandOpen);
+
+                // ---- lightning intensity ramp ----
+                if (currentPower === 'lightning') {
+                    lightningIntensity += anyHandOpen ? CONFIG.lightningRiseWhenOpen : -CONFIG.lightningFallWhenClosed;
+                } else {
+                    lightningIntensity -= CONFIG.lightningFallOtherModes;
+                }
+                lightningIntensity = Math.max(0, Math.min(1, lightningIntensity));
+
+                if (lightningIntensity > 0.01) {
+                    if (Math.random() < 0.5 * lightningIntensity) {
+                        canvasCtx.fillStyle = `rgba(200, 220, 255, ${0.25 * lightningIntensity})`;
+                        canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+                    }
+
+                    hands.forEach((landmarks) => {
+                        if (!isHandOpen(landmarks)) return;
+
+                        [4, 8, 12, 16, 20].forEach(tipIdx => {
+                            const pt = landmarks[tipIdx];
+                            if (Math.random() < 0.07) spawnLightning(pt.x * canvasElement.width, pt.y * canvasElement.height);
+                        });
+
+                        HAND_CONNECTIONS.forEach(([s]) => {
+                            if (Math.random() < 0.005) {
+                                const start = landmarks[s];
+                                spawnLightning(start.x * canvasElement.width, start.y * canvasElement.height);
+                            }
+                        });
+                    });
+                }
+
+                // ---- per-hand elemental effects ----
+                hands.forEach((landmarks, index) => {
+                    const label = results.multiHandedness[index].label;
+                    const isRightHand = label === 'Right';
+                    const targetIndex = isRightHand ? 1 : 0;
+
+                    const isOpen = isHandOpen(landmarks);
+                    const isPinch = isPinching(landmarks, isRightHand);
+
+                    if (currentPower === 'fire_ice' || currentPower === 'red_blue') {
+                        handIntensities[targetIndex] += (isOpen || isPinch) ? CONFIG.intensityRise : -CONFIG.intensityFall;
+                        if (isOpen && !lastHandOpenState[targetIndex]) handSurges[targetIndex] = 1.0;
+                    } else {
+                        handIntensities[targetIndex] -= CONFIG.intensityFall;
+                    }
+                    lastHandOpenState[targetIndex] = isOpen;
+
+                    handSurges[targetIndex] *= CONFIG.surgeDecay;
+                    if (handSurges[targetIndex] < CONFIG.surgeFloor) handSurges[targetIndex] = 0;
+
+                    handIntensities[targetIndex] = Math.max(0, Math.min(1, handIntensities[targetIndex]));
+
+                    const intensity = handIntensities[targetIndex];
+                    if (intensity <= 0.01) return;
+
+                    const style = POWER_STYLES[currentPower] && POWER_STYLES[currentPower][targetIndex];
+                    if (!style) return;
+
+                    const palm = landmarks[9];
+                    const lx = palm.x * canvasElement.width;
+                    const ly = palm.y * canvasElement.height;
+
+                    if (isPinch) {
+                        const indexTip = landmarks[8];
+                        const thumbTip = landmarks[4];
+                        const tx = ((indexTip.x + thumbTip.x) / 2) * canvasElement.width;
+                        const ty = ((indexTip.y + thumbTip.y) / 2) * canvasElement.height;
+
+                        if (Date.now() - startTime > CONFIG.drawUnlockMs) {
+                            spawnParticle(style.type, tx, ty, true);
+                        }
+
+                        // Small visual confirmation ring so you can see
+                        // exactly when a pinch registers.
+                        canvasCtx.globalCompositeOperation = 'source-over';
+                        canvasCtx.beginPath();
+                        canvasCtx.arc(tx, ty, 14, 0, Math.PI * 2);
+                        canvasCtx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+                        canvasCtx.lineWidth = 2;
+                        canvasCtx.stroke();
+                    }
+
+                    renderHandGlow(lx, ly, intensity, targetIndex, style.glow[0], style.glow[1]);
+                    spawnAlongHand(style.type, landmarks);
+                });
+            } else {
+                statusEl.textContent = 'No hands detected';
+                lightningIntensity = Math.max(0, lightningIntensity - CONFIG.lightningFallOtherModes);
+            }
+
+            // ---- particles ----
+            canvasCtx.globalCompositeOperation = 'lighter';
+            particles.forEach((p, index) => {
+                p.x += p.vx;
+                p.y += p.vy;
+                p.life -= (p.decay || 0.06);
+
+                if (p.life <= 0) {
+                    particles.splice(index, 1);
+                    return;
+                }
+
+                const gradient = canvasCtx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.size);
+                const stops = PARTICLE_COLORS[p.type] || PARTICLE_COLORS.fire;
+                stops.forEach(([offset, rgb]) => {
+                    gradient.addColorStop(offset, `rgba(${rgb}, ${p.life * (offset === 0 ? 1 : 0.8)})`);
+                });
+                gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+
+                canvasCtx.fillStyle = gradient;
+                canvasCtx.beginPath();
+                canvasCtx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                canvasCtx.fill();
+            });
+
+            // ---- lightning bolts ----
+            lightningBolts.forEach((b, index) => {
+                b.life -= 0.1;
+                if (b.life <= 0 || b.path.length === 0) {
+                    lightningBolts.splice(index, 1);
+                    return;
+                }
+
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(b.path[0].x, b.path[0].y);
+                for (let i = 1; i < b.path.length; i++) {
+                    canvasCtx.lineTo(b.path[i].x, b.path[i].y);
+                }
+
+                canvasCtx.save();
+                canvasCtx.globalCompositeOperation = 'lighter';
+                canvasCtx.strokeStyle = b.color;
+                canvasCtx.lineWidth = 20;
+                canvasCtx.globalAlpha = b.life * 0.3;
+                canvasCtx.shadowBlur = 30;
+                canvasCtx.shadowColor = b.color;
+                canvasCtx.stroke();
+                canvasCtx.restore();
+
+                canvasCtx.save();
+                canvasCtx.globalCompositeOperation = 'lighter';
+                canvasCtx.strokeStyle = b.color;
+                canvasCtx.lineWidth = 8;
+                canvasCtx.globalAlpha = b.life * 0.6;
+                canvasCtx.stroke();
+                canvasCtx.restore();
+
+                canvasCtx.save();
+                canvasCtx.globalCompositeOperation = 'source-over';
+                canvasCtx.strokeStyle = '#ffffff';
+                canvasCtx.lineWidth = 2;
+                canvasCtx.globalAlpha = b.life;
+                canvasCtx.stroke();
+                canvasCtx.restore();
+            });
+
+            canvasCtx.restore();
+        }
+
+        // ============================================================
+        // Bootstrapping + error handling
+        // ============================================================
+        function startExperience() {
+            hideError();
+            statusEl.textContent = 'Requesting camera…';
+
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                showError(
+                    'Browser not supported',
+                    'This experience needs a browser with webcam (getUserMedia) support. Try a recent version of Chrome, Edge, or Firefox.'
+                );
+                return;
+            }
+
+            let hands;
+            try {
+                hands = new Hands({
+                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+                });
+                hands.setOptions({
+                    maxNumHands: 2,
+                    modelComplexity: 1,
+                    minDetectionConfidence: 0.65,
+                    minTrackingConfidence: 0.65
+                });
+                hands.onResults(onResults);
+            } catch (err) {
+                showError('Failed to load hand-tracking model', 'The MediaPipe model could not be initialized. Check your internet connection and reload the page.');
+                console.error(err);
+                return;
+            }
+
+            const camera = new Camera(videoElement, {
+                onFrame: async () => {
+                    try {
+                        await hands.send({ image: videoElement });
+                    } catch (err) {
+                        console.error('Frame processing error:', err);
+                    }
+                },
+                width: 1280,
+                height: 720
+            });
+
+            camera.start()
+                .then(() => { statusEl.textContent = 'Tracking…'; })
+                .catch((err) => {
+                    console.error('Camera start failed:', err);
+                    const name = err && err.name;
+                    if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+                        showError('Camera permission denied', 'This experience needs webcam access to track your hands. Allow camera access in your browser settings, then try again.');
+                    } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+                        showError('No camera found', 'No webcam was detected on this device. Connect a camera and try again.');
+                    } else {
+                        showError('Camera error', 'Something went wrong starting the camera. Try again, or reload the page.');
+                    }
+                });
+        }
+
+        retryBtn.addEventListener('click', startExperience);
+        window.addEventListener('error', (e) => console.error('Uncaught error:', e.error || e.message));
+
+        startExperience();
+    </script>
+</body>
+
+</html>
